@@ -1,0 +1,80 @@
+{
+  "source": {
+    "listing": "TheJet.bas",
+    "board": "plansze.txt",
+    "article": "6-7_92_thejet.html",
+    "archive": "https://tajemnice.atari8.info/6-7_92/6-7_92_listingi.zip -> 6-7_92.atr -> THEJET.LST, THEJET.COM, THEJET.PLA, JET.COM"
+  },
+  "obj": {
+    "size": 4157,
+    "segments": [
+      {
+        "start": "$2400",
+        "end": "$27FF",
+        "size": 1024
+      },
+      {
+        "start": "$3000",
+        "end": "$3B42",
+        "size": 2883
+      },
+      {
+        "start": "$3E43",
+        "end": "$3F24",
+        "size": 226
+      },
+      {
+        "start": "$02E0",
+        "end": "$02E3",
+        "size": 4
+      }
+    ],
+    "runad": "$3084",
+    "initad": "$3000"
+  },
+  "memory": {
+    "charset": "$2400",
+    "chbas": 36,
+    "code": "$3000",
+    "init": "$3000",
+    "run": "$3084",
+    "pm_base": "$2800",
+    "missiles": "$2B00",
+    "player0": "$2C00",
+    "player1": "$2D00",
+    "jet_shape_y": 176,
+    "jet_shapes": [
+      "$39B2",
+      "$39BF"
+    ],
+    "jet_shape_len": 13,
+    "colours_02C0_02C8": "$39A5",
+    "display_list_game": "$3B00",
+    "display_list_title": "$3B22",
+    "screen": "$3B43",
+    "screen_rows": 24,
+    "screen_cols": 32,
+    "screen_lms": "$3B83",
+    "hud": "$3E43",
+    "title_text": "$3E63",
+    "board_end_ptr": "$3F23",
+    "board": "$3F25",
+    "board_end_ptr_in_listing": "$3F15",
+    "variables": "$3989-$39A4"
+  },
+  "board": {
+    "width": 16,
+    "rows": 142,
+    "bytes": 2413,
+    "chars": [
+      " ",
+      "!",
+      "\"",
+      "#",
+      "$",
+      "%",
+      "<",
+      ">"
+    ]
+  }
+}
