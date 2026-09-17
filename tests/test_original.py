@@ -68,7 +68,7 @@ def test_cycle_model_matches_py65():
     o = ro.Original(OBJ + board_bytes(rows), seed=11, cycles_per_frame=10 ** 9)   # no interrupts in the work
     o.start_game()
     r = random.Random(11)
-    e = Engine(rows, rnd=lambda: r.randrange(256), rtclok=o.mem[0x14], timing=Timing(vblank_rest=10 ** 7))
+    e = Engine(rows, rnd=lambda: r.randrange(256), rtclok=o.mem[0x14], timing=Timing(vblank=10 ** 7))
     mpu = o.mpu
     for it in range(40):
         inp = autopilot(e.mem, e.jet_x, it)
@@ -78,6 +78,12 @@ def test_cycle_model_matches_py65():
         # run the original: the VBI (pending after start_game), then SCROLL and SCAN timed separately
         if it:
             o._vbi()
+        cv = mpu.processorCycles
+        while (mpu.pc, mpu.sp) != o._in_vbi:
+            mpu.step()
+        vbi_cycles = mpu.processorCycles - cv - 23 - 25        # minus the harness's stub and XITVBV
+        o._in_vbi = None
+        assert abs(vbi_cycles - e.vbi_cycles) <= 40, f'VBI cycles: py65 {vbi_cycles}, engine {e.vbi_cycles}'
         while mpu.pc != 0x31B7:
             mpu.step()
         c0 = mpu.processorCycles

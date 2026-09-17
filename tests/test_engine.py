@@ -10,7 +10,7 @@ from hypothesis import given, settings, strategies as st
 from thejet.engine import (COLS, HUD, ROW_20, ROW_M1, DEADLY, Engine, EventKind, Input, Status, Timing,
                            bcd_add, bcd_sub, bcd_to_int, board_bytes, parse_board)
 
-FAST = Timing(vblank_rest=10 ** 7)          # the scan never spills: one iteration per frame
+FAST = Timing(vblank=10 ** 7)          # the scan never spills: one iteration per frame
 IDLE = Input()
 UP = Input.of(up=True)
 FIRE = Input.of(fire=True)

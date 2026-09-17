@@ -116,14 +116,15 @@ MAIN_LOOP: wait for RTCLOK to change (= the VBI above)
      jet colours (normal or flashing), FLASH−−
      DEATH? → lose a jet or game over (§6.2)
 ```
-The main loop runs once per frame **as long as `SCROLL`+`SCAN` finish before
-the next VBI**. `ML_FRAME` remembers `RTCLOK+1` before the scan; if the scan
-ran into the next frame it waits for the frame after that (`ML_WAIT_SCAN`),
-and `MAIN_LOOP` then waits for yet another RTCLOK change: **an iteration that
-spills over the VBI takes three frames**, during which the VBI still runs every
-frame (§7). `tick(inp)` in the engine = the VBI followed by the main-loop
-iteration; the pacing (whether the iteration runs this frame) is a parameter
-of `tick` (§8), decided by the front end from the cycle model of §7.
+The main loop would run once per frame if `SCROLL`+`SCAN` finished before
+the next VBI; they never do (§7). `ML_FRAME` remembers `RTCLOK+1` before the
+scan; when the scan ends in the next frame the loop waits for the frame after
+that (`ML_WAIT_SCAN`), and `MAIN_LOOP` then waits for yet another RTCLOK
+change: **every iteration takes three frames**, during which the VBI runs
+three times — the second one in the middle of the scan (or, on the iterations
+that shift and load a row, both the second and the third). `tick(inp)` in the
+engine = the VBI followed by as much of the main loop as the frame's CPU
+budget allows (§7, §8).
 
 The order inside a frame matters: the VBI sees the grid as the previous
 iteration left it; the iteration sees `JET_X`, the missiles and `DEATH` as the
@@ -382,8 +383,8 @@ adds 499 units.
 the jets: character $6F for each of `JETS + 1` from the right … precisely:
 slot k (0..2) shows $6F if `JETS − (2 − k) ≥ 0` else $54; `HUD[26..31]` = the
 score, six digits. The line is displayed with the OS character set (§10), so
-$6F is the letter `o` and $54 the letter `t`: "Damage:ooo" with three jets,
-"Damage:ott" with one.
+$6F is the letter `o` and $54 is ATASCII $14, the ball graphic ●: "Damage:ooo"
+with three jets, "Damage:o●●" with one — the damage fills up with balls.
 
 ### 5.9 End of the VBI
 `TRIG_PREV = STRIG0`.
@@ -446,41 +447,60 @@ fade-out. The one thing not fixed by the code is **how often the main loop
 runs** (§2): once per frame when `SCROLL`+`SCAN` fit between two VBIs,
 otherwise once per three frames.
 
-Measured with `tools/run_original.py` (py65, CPU cycles only): the VBI takes
-2.6k cycles on average (max 3.5k), the main loop 18k on average and up to 32k
-on the article's board (`--frames 300`). A PAL frame is 35568 cycles before
-ANTIC's DMA; with this display (narrow mode 4, 21 text mode lines, single-line
-player DMA, refresh) ANTIC takes about 10k cycles, the two DLIs wait up to 9
-scanlines on `WSYNC` (≈1k) and the OS vertical blank stages 1 and 2 take
-about 2k, leaving roughly 22k cycles per frame for the game — less than the
-main loop needs on many frames. **[EST]**: the front end's default cycle
-budget and the per-handler costs of the engine's cycle model come from those
-measurements; the true cadence on hardware is an open item (README).
+The engine counts the CPU cycles of every path it takes through `SCROLL`,
+`LOAD_ROW`, `SCAN` and the `VBI` (the 6502 instruction timings of
+`game.asm`, checked against py65 in `tests/test_original.py`: the scan within
+40 cycles, the VBI within 40) and lets the vertical blank interrupt the scan
+when the frame's budget is used up (`Timing`):
+
+```
+budget after a VBI = vblank − (that VBI's cycles) + visible − dli_line · (VSCROL + 1)
+```
+
+`vblank` = the CPU cycles of the vertical blank left after the OS's own
+routines, `visible` = the cycles of the displayed part of the next frame after
+ANTIC's DMA, `dli_line` = what one line of `DLI_SCROLL_END`'s `WSYNC` wait
+costs. The three constants are **[EST]** in the sense that they come from a
+measurement, not from the code: `tools/calibrate_timing.py` runs the same
+game in libatari800 (cycle-exact ANTIC/GTIA/POKEY, AltirraOS) and in the
+engine and reads where the emulator's scan stands at the end of each frame:
+`vblank` = 5883 ± 22 cycles, `visible` = 18645 − 37·(VSCROL+1) with a spread
+of about ±25 (sample board without tanks, 830 frames). The scan of an empty
+board alone costs 22 222 cycles, which is why **no iteration ever fits in one
+frame**: the main loop runs once every three frames (§2), confirmed in
+libatari800 on the sample board, an empty board, a wall-only board and a
+board full of tanks (`tools/atari800_timing.py`). The constants only decide
+at which character the vertical blank interrupts the scan; a different value
+moves that point by a few characters.
 
 ---
 
 ## 8. Engine API
 ```python
-levels/board: parse_board(text) -> list[str]          # board.txt / THEJET.PLA -> rows of 16
-e = Engine(rows, rnd=random.Random(1).randrange)       # GAME_INIT done, first VBI pending
-ev = e.tick(Input(stick=0x0F, trig=1, key=None), run_main=True)
-e.mem            # 800 bytes: rows -2..21 then the status line (bytes, read-only view)
+rows = parse_board(text)                                # board.txt / THEJET.PLA -> rows of 16
+e = Engine(rows, rnd=lambda: r.randrange(256), rtclok=0, timing=Timing())   # GAME_INIT done
+ev = e.tick(Input(stick=0x0F, trig=1, key=None))       # one PAL frame: the VBI, then the main loop
+e.mem            # 800 bytes: rows -2..21 then the status line
 e.missiles       # 256 bytes of missile memory
-e.state          # vscrol, jet_x, missile_x/y, fuel, jets, score, flash, paused, death, status ...
-e.pokey          # (AUDF1, AUDC1, ..., AUDF4, AUDC4) as written this frame (None = not written)
+e.state          # frame, vscrol, jet_x, missile_x/y, fuel, jets, score, flash, death, row, status, iteration
+e.pokey          # AUDF1, AUDC1, ..., AUDF4, AUDC4 as the VBI leaves them
+e.scan_cycles, e.scroll_cycles, e.vbi_cycles           # the cycle model's counts
 ```
-`Input.stick` uses the STICK0 bits, `trig` 0/1, `key` an OS key code or None.
-`run_main=False` makes `tick` run the VBI only (a frame in which the main loop
-is still busy or waiting, §2/§7). Events (`EventKind`): `SHOT`, `HIT` (with
-the hit kind and cell), `SHELL_DROPPED`, `SPLASH`, `JET_HIT`, `FUEL_OUT`,
-`JET_LOST`, `GAME_OVER`, `ROW_LOADED`, `SHIFTED`, `PAUSED`, `RESUMED`,
-`ABORTED`. `status`: `PLAYING`, `PAUSED`, `GAME_OVER`, `ABORTED` (ESC); the
-front end plays the fade-out and the title screen and makes a new engine.
+`Input.stick` uses the STICK0 bits, `trig` 0/1, `key` an OS key code or None;
+`Input.of(up=, left=, right=, fire=, key=)` builds one. The main loop is a
+generator inside the engine that yields whenever the original would wait for
+the vertical blank or be interrupted by it; `tick` runs the VBI and then
+resumes it with the frame's budget (§7). Events (`EventKind`): `VBI` (with
+the scan index it interrupted, −1 if idle), `SHOT`, `HIT` (with the object
+kind and cell), `SHELL_DROPPED`, `SPLASH`, `JET_HIT`, `FUEL_OUT`, `JET_LOST`,
+`GAME_OVER`, `ROW_LOADED`, `SHIFTED`, `PAUSED`, `RESUMED`, `ABORTED`.
+`status`: `PLAYING`, `PAUSED`, `GAME_OVER`, `ABORTED` (ESC); the front end
+plays the fade-out and the title screen and makes a new engine.
 
 Hard requirements: stdlib only; deterministic given the board, the input
-sequence, the `run_main` sequence and the generator; the scan implemented
-literally as one in-place pass with the pointer semantics of §4; type-annotated,
-mypy-clean.
+sequence, the timing constants and the generator; the scan implemented
+literally as one in-place pass with the pointer semantics of §4;
+type-annotated, mypy-clean.
 
 ---
 

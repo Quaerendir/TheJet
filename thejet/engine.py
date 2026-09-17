@@ -43,7 +43,9 @@ HIT_CHARS = (0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0
              0x01, 0x02, 0x03, 0x04)
 HIT_INDEX = {c: k for k, c in enumerate(HIT_CHARS)}
 QUADRANT_DELTA = (0, -1, -0x20, -0x21)           # Q0..Q3: CELL -> the object's top-left
-DEADLY = frozenset((0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x15, 0x17, 0x19, 0x1A, 0x1B, 0x1C))
+DEADLY_LIST = (0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x15, 0x17, 0x19, 0x1A, 0x1B, 0x1C)
+DEADLY = frozenset(DEADLY_LIST)
+DEADLY_ORDER = {c: k for k, c in enumerate(DEADLY_LIST)}     # JET_PROBE searches from the end
 MISSILE_MASKS = (0x01, 0x04, 0x10, 0x40)
 HUD_INIT = bytes.fromhex('2675656c1a10101000' '24616d6167651a545454' '0033636f72651a101010101010')
 JET_X_MIN, JET_X_MAX, JET_X_START = 0x40, 0xB9, 0x70
@@ -99,15 +101,17 @@ class Event:
 
 @dataclass(frozen=True)
 class Timing:
-    """CPU cycles the main loop gets per frame, SPEC.md §7 **[EST]**: `vblank_rest` after the
-    vertical blank routines, `visible` in the displayed part minus the DLI's WSYNC wait of
-    `dli_line` cycles per scanline for VSCROL+1 lines. Calibrated with tools/atari800_timing.py."""
-    vblank_rest: int = 2409
-    visible: int = 19487
-    dli_line: int = 114
+    """CPU cycles the game gets per frame, SPEC.md §7 **[EST]**: `vblank` in the vertical blank
+    after the OS's own routines (the game's VBI, whose cycles the engine counts, comes out of
+    it), `visible` in the displayed part minus the DLI's WSYNC wait of `dli_line` cycles per
+    scanline for VSCROL+1 lines. Calibrated with tools/calibrate_timing.py."""
+    vblank: int = 5883
+    visible: int = 18645
+    dli_line: int = 37
 
-    def frame_budget(self, vscrol: int) -> int:
-        return self.vblank_rest + self.visible - self.dli_line * (vscrol + 1)
+    def frame_budget(self, vscrol: int, vbi_cycles: int) -> int:
+        """Main-loop cycles between the end of one VBI and the start of the next."""
+        return self.vblank - vbi_cycles + self.visible - self.dli_line * (vscrol + 1)
 
 
 DEFAULT_TIMING = Timing()
@@ -213,6 +217,10 @@ class Engine:
         self.cycles = 0                                         # main-loop cycles used in this frame
         self.scan_cycles = 0                                    # cycle model: the last complete scan (JSR..RTS)
         self.scroll_cycles = 0                                  # cycle model: the last SCROLL (JSR..RTS)
+        self.vbi_cycles = 0                                     # cycle model: the last VBI (VBI .. JMP XITVBV)
+        self.iteration_start = 0                                # RTCLOK when the current iteration began
+        self.record_costs = False                               # keep `scan_trace` (tools/calibrate_timing.py)
+        self.scan_trace: dict[int, int] = {}                    # index -> scan cycles before its first visit
         self._events: list[Event] = []
         self._load_row()
         self._main = self._main_loop()
@@ -331,15 +339,18 @@ class Engine:
         step = 0                                                # SC_CHAR visits in this scan
         acc, mark = 0, self.cycles                              # the scan's own cycles across frames
         self.cycles += 6 + 10                                   # JSR SCAN, SCAN_PTR set-up
-        deadline = self.timing.frame_budget(self.vscrol)
+        deadline = self.timing.frame_budget(self.vscrol, self.vbi_cycles)
+        trace = self.scan_trace = {} if self.record_costs else self.scan_trace
         while i < ROW_20:
+            if self.record_costs:
+                trace.setdefault(i, acc + self.cycles - mark)
             if self.cycles >= deadline:                         # the VBI interrupts here
                 self.scan_index = i
                 self.last_split = step
                 acc += self.cycles - mark
                 yield
                 mark = 0                                        # `cycles` restarts from 0 after the VBI
-                deadline = self.timing.frame_budget(self.vscrol)
+                deadline = self.timing.frame_budget(self.vscrol, self.vbi_cycles)
             step += 1
             c = m[i]
             wrap = 4 if ((SCREEN_LO + i + 1) & 0xFF) == 0 else 0   # INC SCAN_PTR+1 on a page boundary
@@ -491,24 +502,56 @@ class Engine:
 
     # ----------------------------------------------------------------- VBI
     def _vbi(self) -> None:
-        """VBI: sounds, then (unless paused) the jet, the shots, the collisions, the fuel, the HUD."""
-        self._sounds()
+        """VBI: sounds, then (unless paused) the jet, the shots, the collisions, the fuel, the HUD.
+        `vbi_cycles` counts the path taken (VBI .. JMP XITVBV)."""
+        cy = 13 + self._sounds()                                # VSCROL, ATRACT, the four envelopes
         if self.paused:
+            self.vbi_cycles = cy + 4 + 2 + 3 + 5                # VB_PAUSED -> VBI_IDLE
             return
-        if not self.stick & 8 and self.jet_x < JET_X_MAX:      # VB_STICK: right
-            self.jet_x += 1
-        if not self.stick & 4 and self.jet_x != JET_X_MIN:     # VB_LEFT
-            self.jet_x -= 1
-        if self.trig == 0 and self.trig_prev != 0:              # VB_FIRE: the trigger just went down
-            for slot in (3, 2, 1, 0):                           # VB_SLOT
+        cy += 4 + 2 + 3
+        if not self.stick & 8:                                  # VB_STICK: right
+            cy += 2 + 4 + 2 + 2
+            if self.jet_x < JET_X_MAX:
+                self.jet_x += 1
+                cy += 2 + 6
+            else:
+                cy += 3
+        else:
+            cy += 3
+        cy += 4 + 2
+        if not self.stick & 4:                                  # VB_LEFT
+            cy += 2 + 4 + 2
+            if self.jet_x != JET_X_MIN:
+                self.jet_x -= 1
+                cy += 2 + 6
+            else:
+                cy += 3
+        else:
+            cy += 3
+        cy += 4
+        if self.trig != 0:                                      # VB_FIRE
+            cy += 3
+        elif self.trig_prev == 0:
+            cy += 2 + 4 + 3
+        else:                                                   # the trigger just went down
+            cy += 2 + 4 + 2 + 2                                 # VB_SLOT
+            for slot in (3, 2, 1, 0):
                 if self.missile_x[slot] == 0:
+                    cy += 4 + 3
                     self.missile_x[slot] = self.jet_x + 2       # VB_SHOOT
                     self.missile_y[slot] = MISSILE_START_Y
                     self.snd_shot = MISSILE_START_Y
-                    self._emit(EventKind.SHOT, self._cell_addr(self.missile_x[slot], MISSILE_START_Y), slot)
+                    cell = self._cell_addr(self.missile_x[slot], MISSILE_START_Y)
+                    cy += 151 + (3 if self.mem[cell] == 0 else 5)
+                    self._emit(EventKind.SHOT, cell, slot)
                     break
+                cy += 11 if slot else 10
+            else:
+                cy += 3                                         # JMP VB_JET
+        cy += 12 + 1763                                         # VB_JET, VB_MISSILES_CLEAR
         mm = self.missiles                                      # VB_MISSILES_CLEAR: y = $29..$D8
         mm[0x29:0xD9] = bytes(0xB0)
+        cy += 2 - 1
         for x in (3, 2, 1, 0):                                  # VB_MISSILES
             self.missile_y[x] = (self.missile_y[x] - 1) & 0xFF
             y = self.missile_y[x]
@@ -518,35 +561,65 @@ class Engine:
             if y < MISSILE_TOP:
                 self.missile_x[x] = 0
                 self.missile_y[x] = MISSILE_TOP - 1
+                cy += 61
+            else:
+                cy += 46
+        cy += 2
         for x in (3, 2, 1, 0):                                  # VB_HITS
+            cy += 2 + 3 + 2 + 4 + 4 + 2 + 4
             if self.missile_x[x] == 0:
+                cy += 3 + (13 if x else 12)
                 continue
             cell = self._cell_addr(self.missile_x[x], self.missile_y[x])
+            cy += 2 + 2 + 86 + 2 + 5 + self._xpen(cell, 0) + 4
             c = self.mem[cell]
             k = HIT_INDEX.get(c)
-            if c == 0 or k is None:
+            if c == 0:
+                cy += 3 + (13 if x else 12)
                 continue
-            cell += QUADRANT_DELTA[k & 3]                       # VH_DISPATCH: quadrant fix
-            self._hit(cell, k)
+            if k is None:
+                cy += 2 + 2 + 51 * 11 + 10 + 3 + (13 if x else 12)
+                continue
+            cy += 2 + 2 + (51 - k) * 11 + 7 + 44                # VH_DISPATCH
+            cell += QUADRANT_DELTA[k & 3]                       # quadrant fix
+            cy += 6 + (6 if k & 3 == 0 else 24) + 6
+            cy += self._hit(cell, k)
             self.snd_shot = 0
             self.pokey[4] = self.pokey[5] = 0                   # AUDF3, AUDC3
             self.snd_splash = 0x0F
             self.missile_x[x] = 0
+            cy += 2 + 4 + 4 + 4 + 2 + 4 + 4 + 3 + 2 + 2 + 5 + (13 if x else 12)
             self._emit(EventKind.HIT, cell, k // 4)
         cell = self._cell_addr(self.jet_x, JET_PROBE_Y)        # VB_JET_HIT
-        for d in (0, 1, 0x20, 0x21):
+        cy += 4 + 2 + 86
+        for n, d in enumerate((0, 1, 0x20, 0x21)):
+            cy += 2 + 6 + 5 + self._xpen(cell, d) + 2
             c = self.mem[cell + d]
-            if c >= 0x48 or c in DEADLY:
-                self.death = 0xFF
-                self._emit(EventKind.JET_HIT, cell + d)
-                break
+            if c >= 0x48:
+                cy += 3 + 12
+            elif c in DEADLY:
+                cy += 2 + 2 + (13 - DEADLY_ORDER[c]) * 11 + 7 + 3 + 12
+            else:
+                cy += 2 + 2 + 13 * 11 + 10 + 6
+                continue
+            self.death = 0xFF
+            self._emit(EventKind.JET_HIT, cell + d)
+            cy += 0                                             # JP_DIE returns; the probes go on
+        cy += 3 + 2
         if self.frame & 0x1F == 0:                              # VB_FUEL: every 32 frames
             self.fuel_lo, b = bcd_sub(self.fuel_lo, 1)
             self.fuel_hi, _ = bcd_sub(self.fuel_hi, 0, b)
+            cy += 2 + 26
+        else:
+            cy += 3
+        cy += 4
         if self.fuel_hi & 0x80:                                 # VB_FUEL_OUT
             self.death = 0xFF
             self.fuel_hi, self.fuel_lo = 0, START_FUEL
             self._emit(EventKind.FUEL_OUT)
+            cy += 2 + 18
+        else:
+            cy += 3
         hud = self.mem
         hud[HUD + 5] = 0x10 | (self.fuel_hi & 0x0F)             # VB_HUD_FUEL
         hud[HUD + 6], hud[HUD + 7] = 0x10 | (self.fuel_lo >> 4), 0x10 | (self.fuel_lo & 0x0F)
@@ -555,35 +628,64 @@ class Engine:
         s = self.score                                          # VB_HUD_SCORE
         for k, b in enumerate((s[2], s[1], s[0])):
             hud[HUD + 26 + 2 * k], hud[HUD + 27 + 2 * k] = 0x10 | (b >> 4), 0x10 | (b & 0x0F)
+        cy += 94 + 83 + 197 + 16                                # the three HUD fields, VB_END
         self.trig_prev = self.trig                              # VB_END
+        self.vbi_cycles = cy
 
-    def _sounds(self) -> None:
-        """The four envelopes of VBI, as POKEY register writes."""
+    def _sounds(self) -> int:
+        """The four envelopes of VBI, as POKEY register writes; returns the cycles used."""
         p = self.pokey
+        cy = 0
         if self.snd_shell:                                      # VB_SND_SHELL
             p[1], p[0] = self.snd_shell, 0x0A
             self.snd_shell += 1
+            cy += 4 + 2 + 4 + 2 + 4 + 6 + 4 + 2
             if self.snd_shell >= 10:
                 self.snd_shell = 0
                 p[0] = p[1] = 0
-        if self.snd_splash and self.frame & 1:                 # VB_SND_SPLASH
+                cy += 2 + 14
+            else:
+                cy += 3
+        else:
+            cy += 7
+        if not self.snd_splash:                                 # VB_SND_SPLASH
+            cy += 7
+        elif not self.frame & 1:
+            cy += 14
+        else:
             p[3] = self.snd_splash | 0x20
             p[2] = (self.snd_splash + 0xDC) & 0xFF
             self.snd_splash -= 1
             if self.snd_splash == 0:
                 p[2] = p[3] = 0
+                cy += 57
+            else:
+                cy += 44
         if self.snd_shot:                                       # VB_SND_SHOT
             p[4] = self.snd_shot
             p[5] = (((self.snd_shot - 0x30) & 0xFF) >> 3) | 0xE0
             self.snd_shot -= 1
             if self.snd_shot == 0:
                 p[4] = p[5] = 0
-        if self.frame & 3 == 0 and self.snd_death:             # VB_SND_DEATH
+                cy += 48
+            else:
+                cy += 35
+        else:
+            cy += 7
+        if self.frame & 3:                                      # VB_SND_DEATH: every fourth frame
+            cy += 8
+        elif not self.snd_death:
+            cy += 14
+        else:
             p[7] = self.snd_death | 0xC0
             p[6] = 0x0A
             self.snd_death -= 1
             if self.snd_death == 0:
                 p[6] = p[7] = 0
+                cy += 47
+            else:
+                cy += 34
+        return cy
 
     @staticmethod
     def _cell_addr(x: int, y: int) -> int:
@@ -594,46 +696,54 @@ class Engine:
         m = self.mem
         m[cell], m[cell + 1], m[cell + 0x20], m[cell + 0x21] = 0x24, 0x25, 0x26, 0x27
 
-    def _hit(self, cell: int, k: int) -> None:
-        """HIT_HANDLERS[k] with CELL at the object's top-left."""
+    def _hit(self, cell: int, k: int) -> int:
+        """HIT_HANDLERS[k] with CELL at the object's top-left; returns the handler's cycles."""
         m = self.mem
         obj = k // 4
         if obj == 0:                                            # HIT_SOFT
             self._put_explosion(cell)
             self._add_score(0x15)
-        elif obj == 1:                                          # HIT_FUEL
+            return 97
+        if obj == 1:                                            # HIT_FUEL
             self._put_explosion(cell)
             self._add_score(0x20)
             self.fuel_lo, c = bcd_add(self.fuel_lo, FUEL_TILE & 0xFF)
             self.fuel_hi, _ = bcd_add(self.fuel_hi, (FUEL_TILE >> 8) + c)
             if self.fuel_hi >= 0x10:                            # HF_CAP
                 self.fuel_hi, self.fuel_lo = 0x09, 0x99
-        elif obj == 2:                                          # HIT_AMMO
+                return 153
+            return 140
+        if obj == 2:                                            # HIT_AMMO
             self._put_explosion(cell)
             self.score[1], c = bcd_add(self.score[1], 1)
             self.score[2], _ = bcd_add(self.score[2], c)
-        elif obj == 3:                                          # HIT_REPAIR
+            return 84
+        if obj == 3:                                            # HIT_REPAIR
             self._put_explosion(cell)
             self._add_score(0x30)
             if self.jets < 2:
                 self.jets += 1
-        elif obj <= 7:                                          # HIT_TANK_R
+                return 120
+            return 115
+        if obj <= 7:                                            # HIT_TANK_R
             self._put_explosion(cell)
             m[cell + 2] = m[cell + 0x22] = 0
             self._add_score(0x55)
-        elif obj <= 11:                                         # HIT_TANK_L
+            return 115
+        if obj <= 11:                                           # HIT_TANK_L
             self._put_explosion(cell)
             m[cell - 1] = m[cell + 0x1F] = 0
             self._add_score(0x55)
-        else:                                                   # HIT_HARD
-            d = 0x40 if k & 2 else 0x20
-            m[cell + d + (k & 1)] = 0x1F
-            self.snd_splash = 0x0A
+            return 133
+        d = 0x40 if k & 2 else 0x20                             # HIT_HARD
+        m[cell + d + (k & 1)] = 0x1F
+        self.snd_splash = 0x0A
+        return 37
 
     # ----------------------------------------------------------------- MAIN_LOOP
     def _main_loop(self) -> Iterator[None]:
         while True:
-            start = self.frame                                  # MAIN_LOOP: a VBI has just run
+            start = self.iteration_start = self.frame           # MAIN_LOOP: a VBI has just run
             if self.ch == KEY_ESC:
                 self.status = Status.ABORTED
                 self._emit(EventKind.ABORTED)
@@ -650,7 +760,7 @@ class Engine:
                 self.ch = 0xFF
                 self.status = Status.PLAYING
                 self._emit(EventKind.RESUMED)
-                start = self.frame
+                start = self.iteration_start = self.frame
             self.scroll_cycles = self._scroll()                 # ML_FRAME
             self.cycles += self.scroll_cycles + 4 + 2 + 4 + 3 + 2 + 2 + 3   # + jet colours, A = RTCLOK + 1, PHA
             yield from self._scan()
