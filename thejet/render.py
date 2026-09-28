@@ -289,7 +289,7 @@ class Pokey:
     POLY5 = _lfsr(5, 3)               # x^5 + x^3 + 1
     POLY17: bytes | None = None
 
-    def __init__(self, sample_rate: int = SAMPLE_RATE, amplitude: int = 9000) -> None:
+    def __init__(self, sample_rate: int = SAMPLE_RATE, amplitude: int = 8000) -> None:
         self.sample_rate = sample_rate
         self.amplitude = amplitude
         if Pokey.POLY17 is None:
@@ -330,23 +330,32 @@ class Pokey:
         n_out = int(n_out_f)
         self.pending = n_out_f - n_out
         samples = array.array('h')
-        gain = self.amplitude / 15
+        gain = self.amplitude / 15                # a channel at volume 15 -> `amplitude`; silence -> 0
         for k in range(n_out):
             a = k * n_base // n_out
             b = max(a + 1, (k + 1) * n_base // n_out)
             mean = sum(levels[a:b]) / (b - a)
-            samples.append(int(mean * gain) - self.amplitude)
+            samples.append(min(32767, int(mean * gain)))
         return samples
 
 
 class Sounds:
-    """Feeds the POKEY model with the engine's registers every frame and streams the result."""
+    """Feeds the POKEY model with the engine's registers every frame and streams the result.
+
+    A mixer channel holds one playing and one queued sound, so frames rendered while both slots
+    are taken are kept in `backlog` and submitted together once a slot frees up; nothing is
+    dropped and nothing is cut short. The stream starts with `LEAD` frames of silence so that
+    frame-timing jitter does not drain the channel (an idle channel plays nothing, which would
+    be a gap - inaudible in silence, a click inside a tone).
+    """
+    LEAD = 2
 
     def __init__(self, enabled: bool = True) -> None:
         self.enabled = False
         self._pokey = Pokey()
         self._channel: pygame.mixer.Channel | None = None
         self.last: array.array[int] | None = None
+        self.backlog = array.array('h')
         if not enabled:
             return
         try:
@@ -355,13 +364,18 @@ class Sounds:
         except pygame.error:
             return
         self.enabled = True
+        for _ in range(self.LEAD):
+            self.backlog.extend(self._pokey.render_frame([0] * 8))
 
     def frame(self, regs: Sequence[int]) -> None:
         self.last = self._pokey.render_frame(regs)
         if not self.enabled or self._channel is None:
             return
-        snd = pygame.mixer.Sound(buffer=self.last.tobytes())
-        if self._channel.get_busy():
-            self._channel.queue(snd)
+        self.backlog.extend(self.last)
+        if not self._channel.get_busy():
+            self._channel.play(pygame.mixer.Sound(buffer=self.backlog.tobytes()))
+        elif self._channel.get_queue() is None:
+            self._channel.queue(pygame.mixer.Sound(buffer=self.backlog.tobytes()))
         else:
-            self._channel.play(snd)
+            return
+        self.backlog = array.array('h')

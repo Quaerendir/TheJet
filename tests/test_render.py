@@ -97,7 +97,7 @@ def test_text_font_blocks_without_os_font():
 def test_pokey_continuous_tone_and_silence():
     p = Pokey()
     silent = p.render_frame([0] * 8)
-    assert len(silent) in (881, 882, 883) and max(silent) == min(silent)
+    assert len(silent) in (881, 882, 883) and max(silent) == min(silent) == 0    # no DC offset
     tone = p.render_frame([0x14, 0xEF, 0, 0, 0, 0, 0, 0])            # channel 1: pure tone, volume 15
     assert max(tone) > min(tone)
     mid = (max(tone) + min(tone)) / 2
@@ -110,3 +110,11 @@ def test_sounds_headless():
     s = Sounds(enabled=True)
     s.frame([0x0A, 0x05, 0, 0, 0xB0, 0xE0, 0, 0])
     assert s.last is not None and len(s.last) > 800
+    if s.enabled:                                                     # the lead and the frame were submitted
+        assert len(s.backlog) == 0
+
+
+def test_pokey_full_volume_fits_16_bit():
+    p = Pokey()
+    loud = p.render_frame([0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF])   # four channels at volume 15
+    assert 0 <= min(loud) and max(loud) <= 32767
